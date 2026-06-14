@@ -1,0 +1,6 @@
+<launch>
+    <!-- Load the agents configuration YAML into the ROS parameter server -->
+    <rosparam file="$(find rhcr_mapf_planners)/config/demo_agents.yaml" command="load" />
+    <!-- Launch the RHCR planner node -->
+    <node name="rhcr_planner" pkg="rhcr_mapf_planners" type="rhcr_planner_node" output="screen" />
+</launch>

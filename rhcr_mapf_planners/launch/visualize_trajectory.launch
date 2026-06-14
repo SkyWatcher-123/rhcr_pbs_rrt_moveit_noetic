@@ -1,0 +1,33 @@
+<launch>
+    <!-- Path parameters -->
+    <arg name="output_folder" value="irb_xarm_moveit_config"/>
+    <arg name="output_file"   value="trajectory.json"/>
+    <arg name="delta_time"    value="0.02"/>
+    <arg name="rate_scale"    value="1.0"/>
+
+    <!-- Pass-through to visualizer node -->
+    <arg name="config_yaml" default="$(find rhcr_mapf_planners)/config/demo_agents.yaml"/>
+
+    <node name="trajectory_visualizer"
+            pkg="rhcr_mapf_planners"
+            type="trajectory_visualizer_node"
+            output="screen">
+
+        <!-- Load YAML -->
+        <rosparam file="$(arg config_yaml)" command="load"/>
+
+        <!-- Overridable parameters -->
+        <param name="output_folder" value="$(arg output_folder)"/>
+        <param name="output_file" value="$(arg output_file)"/>
+
+        <param name="parent_group" value="arms"/>
+
+        <!-- Standard timing params -->
+        <param name="delta_time" value="0.1"/>
+        <param name="rate_scale" value="1.0"/>
+
+    </node>
+
+
+
+</launch>

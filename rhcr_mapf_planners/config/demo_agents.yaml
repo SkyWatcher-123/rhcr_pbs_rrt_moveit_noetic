@@ -1,0 +1,62 @@
+parent_group: "arms"
+
+agents:
+  - name: robot1
+    move_group: irb
+    joint_names:
+      - irb120joint_1
+      - irb120joint_2
+      - irb120joint_3
+      - irb120joint_4
+      - irb120joint_5
+      - irb120joint_6
+
+    folded_joint: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    goals:
+      # joint goal
+      # - joint: [1.5, -0.5, 0.5, 1.0, -1.0, 3.0]
+      # - joint: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+      - joint: [0.5, 1.0, -1.0, 0.0, 0.0, 0.0]
+      - joint: [-0.5, 1.0, -1.0, 0.0, 0.0, 0.0]
+      # - joint: [-0.5, 0.0, -1.0, 0.0, 0.0, 0.0]
+      
+      # pose goal
+      # - pose:
+      #     frame_id: base_link        # optional, defaults to MoveIt default
+      #     end_effector_link: ""      # optional
+      #     position: [0.6, 0.2, 0.4]  # x y z
+      #     orientation_rpy: [0.0, 1.57, 0.0]  # roll pitch yaw (rad)
+
+  - name: robot2
+    move_group: xarm
+    joint_names:
+      - xarm6joint1
+      - xarm6joint2
+      - xarm6joint3
+      - xarm6joint4
+      - xarm6joint5
+      - xarm6joint6
+    folded_joint: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+    goals:
+      # - joint: [-2.7, 0.0, -1.5, -1.5, 1.5, -2.0]
+      # - joint: [0, -1.0, -1.0, 0.0, 1.0, 0.0]
+      # - joint: [-0.5, 0.75, -2.0, 0, 1.0, 0.0]
+      - joint: [0.5, 0.75, -2.0, 0, 1.0, 0.0]
+      - joint: [-0.5, 0.75, -2.0, 0, 1.0, 0.0]
+      
+      # - pose:
+      #     frame_id: base_link
+      #     position: [0.4, -0.2, 0.4]
+      #     orientation_rpy: [0.0, -1.57, 0.0]
+    
+
+# NEW: global parameters
+delta_time: 0.1
+max_velocity_scaling: 0.8
+max_acceleration_scaling: 0.8
+pbs_use_replanning: True    # for now, keep false; framework is provided
+
+output_folder: "irb_xarm_moveit_config"    # or xxx_moveit_config, etc.
+output_file: "trajectory.json"
+
