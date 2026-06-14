@@ -4,8 +4,10 @@
 #include <random>
 #include <limits>
 #include <cmath>
+#include <algorithm>
 
 #include <moveit/collision_detection/collision_common.h>
+#include <moveit/robot_state/robot_state.h>
 
 namespace rhcr_mapf_planners
 {
@@ -26,11 +28,24 @@ TimeAwareRRT::TimeAwareRRT(const moveit::core::RobotModelConstPtr& robot_model,
   , max_nodes_(max_nodes)
   , v_max_(1.0)  // default 1 rad/s
 {
+  work_state_.reset(new moveit::core::RobotState(robot_model_));
+  work_state_->setToDefaultValues();
 }
 
 void TimeAwareRRT::setMaxJointVelocity(double v_max)
 {
   v_max_ = v_max;
+  v_max_per_joint_.clear();
+}
+
+void TimeAwareRRT::setMaxJointVelocities(const std::vector<double>& v_max_per_joint)
+{
+  v_max_per_joint_ = v_max_per_joint;
+}
+
+void TimeAwareRRT::setWaitBias(double wait_bias)
+{
+  wait_bias_ = std::max(0.0, std::min(1.0, wait_bias));
 }
 
 std::vector<double> TimeAwareRRT::sampleRandomConfiguration(const moveit::core::JointModelGroup* jmg) const
@@ -81,7 +96,10 @@ int TimeAwareRRT::findNearestNode(const std::vector<Node>& tree,
   for (std::size_t i = 0; i < tree.size(); ++i)
   {
     double d2 = distanceSquared(tree[i].q, q_sample);
-    if (d2 < best_dist2)
+    // Break ties toward larger t so chained WAIT edges advance forward in time.
+    if (d2 < best_dist2 - 1e-12 ||
+        (std::fabs(d2 - best_dist2) <= 1e-12 &&
+         (best_idx < 0 || tree[i].t > tree[best_idx].t)))
     {
       best_dist2 = d2;
       best_idx = static_cast<int>(i);
@@ -97,31 +115,21 @@ std::vector<double> TimeAwareRRT::steer(const std::vector<double>& q_from,
   if (q_from.size() != q_to.size())
     return q_new;
 
-  // Maximum allowed motion per joint in one time step
-  double max_step = v_max_ * delta_time_;
-
-  double max_diff = 0.0;
+  // Limit motion so every joint respects its own velocity bound over one step,
+  // while preserving the straight-line direction toward q_to.
+  double scale = 1.0;
   for (std::size_t i = 0; i < q_from.size(); ++i)
   {
-    double diff = q_to[i] - q_from[i];
-    if (std::fabs(diff) > max_diff)
-      max_diff = std::fabs(diff);
+    double diff   = q_to[i] - q_from[i];
+    double vmax_i = (i < v_max_per_joint_.size()) ? v_max_per_joint_[i] : v_max_;
+    double step_i = vmax_i * delta_time_;
+    double ad     = std::fabs(diff);
+    if (ad > step_i && ad > 1e-12)
+      scale = std::min(scale, step_i / ad);
   }
-
-  if (max_diff < 1e-9)
-  {
-    return q_new;  // already at target
-  }
-
-  double scale = max_step / max_diff;
-  if (scale > 1.0)
-    scale = 1.0;
 
   for (std::size_t i = 0; i < q_from.size(); ++i)
-  {
-    double diff = q_to[i] - q_from[i];
-    q_new[i] = q_from[i] + scale * diff;
-  }
+    q_new[i] = q_from[i] + scale * (q_to[i] - q_from[i]);
 
   return q_new;
 }
@@ -134,7 +142,8 @@ bool TimeAwareRRT::isStateValid(const std::vector<double>& q,
   if (!jmg)
     return false;
 
-  moveit::core::RobotState& rs = planning_scene_->getCurrentStateNonConst();
+  // Use a private scratch state instead of mutating the shared planning scene.
+  moveit::core::RobotState& rs = *work_state_;
   rs.setToDefaultValues();
 
   // Set this agent
@@ -165,30 +174,34 @@ bool TimeAwareRRT::isStateValid(const std::vector<double>& q,
   return !cres.collision;
 }
 
-const std::vector<double>& TimeAwareRRT::getAgentPositionsAtTime(std::size_t agent_index,
-                                                                 double t_query) const
+std::vector<double> TimeAwareRRT::getAgentPositionsAtTime(std::size_t agent_index,
+                                                          double t_query) const
 {
   const AgentInfo& agent = agents_[agent_index];
   const auto& traj = agent.trajectory;
 
   if (traj.empty())
-  {
-    // This is logically problematic, but for safety, return a reference to a
-    // dummy static vector. In practice, agents used as obstacles should always
-    // have a non-empty trajectory.
-    static const std::vector<double> dummy;
-    return dummy;
-  }
+    return {};
 
-  if (t_query <= traj.front().time + 1e-6)
+  if (t_query <= traj.front().time)
     return traj.front().positions;
-  if (t_query >= traj.back().time - 1e-6)
+  if (t_query >= traj.back().time)
     return traj.back().positions;
 
-  for (std::size_t i = 0; i < traj.size(); ++i)
+  // Linear interpolation between the two bracketing waypoints.
+  for (std::size_t i = 0; i + 1 < traj.size(); ++i)
   {
-    if (traj[i].time >= t_query - 1e-6)
-      return traj[i].positions;
+    double t0 = traj[i].time, t1 = traj[i + 1].time;
+    if (t_query >= t0 && t_query <= t1)
+    {
+      double a = (t1 > t0) ? (t_query - t0) / (t1 - t0) : 0.0;
+      const auto& q0 = traj[i].positions;
+      const auto& q1 = traj[i + 1].positions;
+      std::vector<double> q(q0.size());
+      for (std::size_t j = 0; j < q0.size(); ++j)
+        q[j] = (1.0 - a) * q0[j] + a * q1[j];
+      return q;
+    }
   }
   return traj.back().positions;
 }
@@ -258,29 +271,41 @@ bool TimeAwareRRT::plan(double t_start,
   // Main RRT loop
   for (std::size_t iter = 0; iter < max_nodes_; ++iter)
   {
-    // 1) Sample configuration (joint space) with goal bias
-    std::vector<double> q_sample = sampleBiasedConfiguration(jmg, q_goal, goal_bias);
+    // 1) Choose between a WAIT expansion (hold configuration, advance time) and a
+    //    normal sample-and-steer expansion. Waiting lets a lower-priority agent
+    //    yield by pausing in place until a higher-priority agent has cleared.
+    bool do_wait = (uni01(rng) < wait_bias_);
 
-    // 2) Nearest neighbor in the existing tree
-    int nn_idx = findNearestNode(tree, q_sample);
-    if (nn_idx < 0)
-      continue;
+    int nn_idx;
+    std::vector<double> q_new;
+    if (do_wait)
+    {
+      // Wait at the node currently closest to the goal; the larger-t tie-break in
+      // findNearestNode lets successive waits chain forward in time.
+      nn_idx = findNearestNode(tree, q_goal);
+      if (nn_idx < 0)
+        continue;
+      q_new = tree[nn_idx].q;  // hold configuration
+    }
+    else
+    {
+      std::vector<double> q_sample = sampleBiasedConfiguration(jmg, q_goal, goal_bias);
+      nn_idx = findNearestNode(tree, q_sample);
+      if (nn_idx < 0)
+        continue;
+      q_new = steer(tree[nn_idx].q, q_sample);
+    }
 
-    const Node& parent = tree[nn_idx];
-
-    // 3) Enforce forward time stepping: t_new = t_parent + delta_time_
-    double t_new = parent.t + delta_time_;
+    // 2) Enforce forward time stepping: t_new = t_parent + delta_time_
+    double t_new = tree[nn_idx].t + delta_time_;
     if (t_new > max_time)
       continue;  // out of horizon
 
-    // 4) Steer in joint space from parent.q toward q_sample respecting velocity limit
-    std::vector<double> q_new = steer(parent.q, q_sample);
-
-    // 5) Check state validity with dynamic constraints
+    // 3) Check state validity with dynamic constraints
     if (!isStateValid(q_new, t_new, higher_priority_indices, jmg))
       continue;
 
-    // 6) Add new node
+    // 4) Add new node
     Node child;
     child.q = q_new;
     child.t = t_new;
@@ -288,7 +313,7 @@ bool TimeAwareRRT::plan(double t_start,
     tree.push_back(child);
     int child_idx = static_cast<int>(tree.size()) - 1;
 
-    // 7) Check goal condition (joint-space distance only)
+    // 5) Check goal condition (joint-space distance only)
     double d2_goal = distanceSquared(q_new, q_goal);
     if (std::sqrt(d2_goal) <= goal_tol)
     {

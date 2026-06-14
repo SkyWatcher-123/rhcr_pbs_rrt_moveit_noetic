@@ -2,9 +2,14 @@
 
 #include <ros/ros.h>
 #include <unordered_map>
+#include <set>
+#include <utility>
 #include <cmath>
+#include <limits>
+#include <algorithm>
 
 #include <moveit/collision_detection/collision_common.h>
+#include <moveit/robot_state/robot_state.h>
 
 namespace rhcr_mapf_planners
 {
@@ -20,31 +25,37 @@ PBS::PBS(const moveit::core::RobotModelConstPtr& robot_model,
   , horizon_(horizon)
   , max_rrt_nodes_(max_rrt_nodes)
 {
+  work_state_.reset(new moveit::core::RobotState(robot_model_));
+  work_state_->setToDefaultValues();
 }
 
-// === Public entry point ===
+// === Public entry points ===
 bool PBS::resolveConflicts(std::vector<AgentInfo>& agents)
+{
+  return resolveConflicts(agents, 0.0, std::numeric_limits<double>::infinity());
+}
+
+bool PBS::resolveConflicts(std::vector<AgentInfo>& agents, double w_start, double w_end)
 {
   PBSNode root;
   root.agents = agents;
   root.constraints.clear();
 
-  std::size_t max_depth = agents.size() * 2;  // heuristic limit
+  // Worst case the priority order is a total order, so allow up to O(N^2) branches.
+  std::size_t max_depth = agents.size() * agents.size() + agents.size() + 2;
 
-  bool ok = solveNode(root, 0, max_depth);
+  bool ok = solveNode(root, 0, max_depth, w_start, w_end);
   if (ok)
-  {
     agents = root.agents;
-  }
   else
-  {
-    ROS_WARN("PBS::resolveConflicts: failed to find conflict-free solution.");
-  }
+    ROS_WARN("PBS::resolveConflicts: no conflict-free solution in window [%.2f, %.2f].",
+             w_start, w_end);
   return ok;
 }
 
 // === Core recursive solver ===
-bool PBS::solveNode(PBSNode& node, std::size_t depth, std::size_t max_depth)
+bool PBS::solveNode(PBSNode& node, std::size_t depth, std::size_t max_depth,
+                    double w_start, double w_end)
 {
   if (depth > max_depth)
   {
@@ -52,56 +63,102 @@ bool PBS::solveNode(PBSNode& node, std::size_t depth, std::size_t max_depth)
     return false;
   }
 
-  Conflict c = findEarliestConflict(node);
+  Conflict c = findEarliestConflict(node, w_start, w_end);
   if (!c.valid)
-  {
-    // No conflicts: success
-    return true;
-  }
+    return true;  // window is conflict-free
 
   ROS_INFO("PBS: conflict at t=%.3f between %s and %s (depth=%zu).",
-           c.t,
-           node.agents[c.a].name.c_str(),
-           node.agents[c.b].name.c_str(),
-           depth);
+           c.t, node.agents[c.a].name.c_str(), node.agents[c.b].name.c_str(), depth);
 
-  // Branch 1: a ≺ b (a before b, b yields)
+  // Branch 1: a precedes b (b yields). Skip if it would contradict an existing b precedes a.
+  if (!isBefore(node, c.b, c.a))
   {
     PBSNode child = node;
     child.constraints.push_back(PriorityConstraint{c.a, c.b});
-    double freeze_margin = delta_time_;  // extended interval around conflict
-    bool replanned = localReplan(child, c.b, c.t, freeze_margin, 0.05);
-    if (replanned)
+    if (replanAndMakeConsistent(child, c.b, c.t, w_start, w_end) &&
+        solveNode(child, depth + 1, max_depth, w_start, w_end))
     {
-      if (solveNode(child, depth + 1, max_depth))
-      {
-        node = child;
-        return true;
-      }
+      node = child;
+      return true;
     }
   }
 
-  // Branch 2: b ≺ a
+  // Branch 2: b precedes a (a yields).
+  if (!isBefore(node, c.a, c.b))
   {
     PBSNode child = node;
     child.constraints.push_back(PriorityConstraint{c.b, c.a});
-    double freeze_margin = delta_time_;
-    bool replanned = localReplan(child, c.a, c.t, freeze_margin, 0.05);
-    if (replanned)
+    if (replanAndMakeConsistent(child, c.a, c.t, w_start, w_end) &&
+        solveNode(child, depth + 1, max_depth, w_start, w_end))
     {
-      if (solveNode(child, depth + 1, max_depth))
-      {
-        node = child;
-        return true;
-      }
+      node = child;
+      return true;
     }
   }
 
   return false;
 }
 
-// === Conflict detection (earliest in time) ===
-PBS::Conflict PBS::findEarliestConflict(const PBSNode& node) const
+// === Conflict detection ===
+void PBS::buildLinkToAgent(const PBSNode& node,
+                           std::unordered_map<std::string, std::size_t>& m) const
+{
+  m.clear();
+  for (std::size_t i = 0; i < node.agents.size(); ++i)
+  {
+    const auto* jmg = robot_model_->getJointModelGroup(node.agents[i].move_group);
+    if (!jmg)
+      continue;
+    for (const auto& link : jmg->getLinkModelNames())
+      m[link] = i;
+  }
+}
+
+// Place ALL agents at their interpolated positions at time t and collect every
+// colliding (agent, agent) pair (ordered low<high). World/self contacts are ignored.
+void PBS::collidingPairsAtTime(const PBSNode& node, double t,
+                               const std::unordered_map<std::string, std::size_t>& m,
+                               std::set<std::pair<std::size_t, std::size_t>>& pairs) const
+{
+  moveit::core::RobotState& rs = *work_state_;
+  rs.setToDefaultValues();
+
+  for (std::size_t ai = 0; ai < node.agents.size(); ++ai)
+  {
+    const auto* jmg = robot_model_->getJointModelGroup(node.agents[ai].move_group);
+    if (!jmg)
+      continue;
+    std::vector<double> q = getAgentPositionsAtTime(node.agents[ai], t);
+    if (q.size() == jmg->getVariableCount())
+      rs.setJointGroupPositions(jmg, q);
+  }
+  rs.update();
+
+  collision_detection::CollisionRequest creq;
+  collision_detection::CollisionResult  cres;
+  creq.contacts = true;
+  creq.max_contacts = 1000;
+  creq.max_contacts_per_pair = 1;
+
+  planning_scene_->checkCollision(creq, cres, rs);
+  if (!cres.collision)
+    return;
+
+  for (const auto& kv : cres.contacts)
+  {
+    auto it1 = m.find(kv.first.first);
+    auto it2 = m.find(kv.first.second);
+    if (it1 == m.end() || it2 == m.end())
+      continue;                 // contact with the static world: not an inter-agent conflict
+    if (it1->second == it2->second)
+      continue;                 // self-collision within one agent: ignored in PBS
+    std::size_t lo = std::min(it1->second, it2->second);
+    std::size_t hi = std::max(it1->second, it2->second);
+    pairs.insert(std::make_pair(lo, hi));
+  }
+}
+
+PBS::Conflict PBS::findEarliestConflict(const PBSNode& node, double w_start, double w_end) const
 {
   Conflict result;
   result.valid = false;
@@ -111,96 +168,74 @@ PBS::Conflict PBS::findEarliestConflict(const PBSNode& node) const
   if (node.agents.empty())
     return result;
 
-  // Precompute link->agent mapping for collision contacts
   std::unordered_map<std::string, std::size_t> link_to_agent;
-  for (std::size_t i = 0; i < node.agents.size(); ++i)
-  {
-    const auto* jmg = robot_model_->getJointModelGroup(node.agents[i].move_group);
-    if (!jmg)
-      continue;
-    for (const auto& link : jmg->getLinkModelNames())
-      link_to_agent[link] = i;
-  }
+  buildLinkToAgent(node, link_to_agent);
 
-  planning_scene::PlanningScene local_scene(robot_model_);
   double max_time = getMaxTrajectoryTime(node);
   if (max_time <= 0.0)
     return result;
 
-  int max_step = static_cast<int>(std::floor(max_time / delta_time_));
+  double t_lo = std::max(0.0, w_start);
+  int step_lo = static_cast<int>(std::ceil(t_lo / delta_time_ - 1e-9));
+  int step_hi = static_cast<int>(std::floor(max_time / delta_time_));
 
-  double earliest_t = std::numeric_limits<double>::infinity();
-  std::size_t ca = 0, cb = 0;
-
-  for (int step = 0; step <= max_step; ++step)
+  std::set<std::pair<std::size_t, std::size_t>> pairs;
+  for (int step = step_lo; step <= step_hi; ++step)
   {
     double t = step * delta_time_;
+    if (t >= w_end)
+      break;
 
-    moveit::core::RobotState& rs = local_scene.getCurrentStateNonConst();
-    rs.setToDefaultValues();
-
-    // set all agents at time t
-    for (std::size_t ai = 0; ai < node.agents.size(); ++ai)
+    pairs.clear();
+    collidingPairsAtTime(node, t, link_to_agent, pairs);
+    if (!pairs.empty())
     {
-      const AgentInfo& ag = node.agents[ai];
-      const auto* jmg = robot_model_->getJointModelGroup(ag.move_group);
-      if (!jmg)
-        continue;
-      const auto& q = getAgentPositionsAtTime(ag, t);
-      if (q.size() == jmg->getVariableCount())
-        rs.setJointGroupPositions(jmg, q);
-    }
-    rs.update();
-
-    collision_detection::CollisionRequest creq;
-    collision_detection::CollisionResult  cres;
-    creq.contacts     = true;
-    creq.max_contacts = 1;
-
-    local_scene.checkCollision(creq, cres, rs);
-    if (!cres.collision)
-      continue;
-
-    auto ct = cres.contacts.begin();
-    if (ct == cres.contacts.end())
-      continue;
-
-    const std::string& link1 = ct->first.first;
-    const std::string& link2 = ct->first.second;
-
-    auto it1 = link_to_agent.find(link1);
-    auto it2 = link_to_agent.find(link2);
-    if (it1 == link_to_agent.end() || it2 == link_to_agent.end())
-      continue;
-
-    std::size_t a = it1->second;
-    std::size_t b = it2->second;
-    if (a == b)
-      continue;  // self-collision; ignore in PBS
-
-    if (t < earliest_t)
-    {
-      earliest_t = t;
-      ca = a;
-      cb = b;
       result.valid = true;
+      result.a = pairs.begin()->first;
+      result.b = pairs.begin()->second;
+      result.t = t;
+      return result;  // earliest, since we scan time ascending
     }
-  }
-
-  if (result.valid)
-  {
-    result.a = ca;
-    result.b = cb;
-    result.t = earliest_t;
   }
   return result;
 }
 
-// === Priority utilities ===
+bool PBS::firstConflictTime(const PBSNode& node, std::size_t a, std::size_t b,
+                            double w_start, double w_end, double& t_out) const
+{
+  std::unordered_map<std::string, std::size_t> link_to_agent;
+  buildLinkToAgent(node, link_to_agent);
 
+  double max_time = getMaxTrajectoryTime(node);
+  if (max_time <= 0.0)
+    return false;
+
+  std::pair<std::size_t, std::size_t> want(std::min(a, b), std::max(a, b));
+
+  double t_lo = std::max(0.0, w_start);
+  int step_lo = static_cast<int>(std::ceil(t_lo / delta_time_ - 1e-9));
+  int step_hi = static_cast<int>(std::floor(max_time / delta_time_));
+
+  std::set<std::pair<std::size_t, std::size_t>> pairs;
+  for (int step = step_lo; step <= step_hi; ++step)
+  {
+    double t = step * delta_time_;
+    if (t >= w_end)
+      break;
+    pairs.clear();
+    collidingPairsAtTime(node, t, link_to_agent, pairs);
+    if (pairs.count(want))
+    {
+      t_out = t;
+      return true;
+    }
+  }
+  return false;
+}
+
+// === Priority utilities ===
 bool PBS::isBefore(const PBSNode& node, std::size_t before, std::size_t after) const
 {
-  // Simple DFS over constraints to see if before ≺ after is implied
   std::vector<bool> visited(node.agents.size(), false);
   std::vector<std::size_t> stack;
   stack.push_back(before);
@@ -215,10 +250,8 @@ bool PBS::isBefore(const PBSNode& node, std::size_t before, std::size_t after) c
       continue;
     visited[cur] = true;
     for (const auto& c : node.constraints)
-    {
       if (c.before == cur && !visited[c.after])
         stack.push_back(c.after);
-    }
   }
   return false;
 }
@@ -231,36 +264,185 @@ std::vector<std::size_t> PBS::getHigherPriorityAgents(const PBSNode& node,
   {
     if (i == agent_idx)
       continue;
-    // if i ≺ agent_idx according to constraints, then i is higher priority
-    if (isBefore(node, i, agent_idx))
+    if (isBefore(node, i, agent_idx))  // i precedes agent_idx => i is higher priority
       result.push_back(i);
   }
   return result;
 }
 
-// === Goal-segment reasoning ===
-
-std::pair<int, double> PBS::findActiveGoalSegment(const AgentInfo& agent,
-                                                  double t_conflict,
-                                                  double goal_tol) const
+// === Replanning ===
+bool PBS::replanAndMakeConsistent(PBSNode& node, std::size_t yield_agent,
+                                  double t_seed, double w_start, double w_end)
 {
-  int active_g = -1;
-  double t_last_goal = 0.0;
+  std::set<std::size_t> work;
+  std::unordered_map<std::size_t, double> seed;
+  work.insert(yield_agent);
+  seed[yield_agent] = t_seed;
 
-  if (agent.goals.empty() || agent.trajectory.empty())
-    return {active_g, t_last_goal};
+  std::size_t budget = node.agents.size() * 5 + 5;
+  std::size_t iters = 0;
 
-  // Precompute first time each goal is reached along this trajectory
-  std::vector<double> goal_times(agent.goals.size(), std::numeric_limits<double>::infinity());
+  while (!work.empty())
+  {
+    if (++iters > budget)
+      return false;  // could not reach consistency within budget
 
-  for (std::size_t g = 0; g < agent.goals.size(); ++g)
+    // Topological pick: an agent with no higher-priority agent still pending,
+    // so each agent is replanned only after the agents it must avoid are final.
+    std::size_t a = *work.begin();
+    for (std::size_t cand : work)
+    {
+      bool blocked = false;
+      for (std::size_t o : work)
+        if (o != cand && isBefore(node, o, cand)) { blocked = true; break; }
+      if (!blocked) { a = cand; break; }
+    }
+    work.erase(a);
+
+    double ts = seed.count(a) ? seed[a] : w_start;
+    if (!replanAgentSuffix(node, a, ts, w_start, w_end))
+      return false;
+
+    // After replanning a, propagate to any ordered partner that now conflicts.
+    for (std::size_t b = 0; b < node.agents.size(); ++b)
+    {
+      if (b == a)
+        continue;
+      double tc = 0.0;
+      if (!firstConflictTime(node, a, b, w_start, w_end, tc))
+        continue;
+
+      if (isBefore(node, a, b))        // a higher than b => b must yield
+      {
+        work.insert(b);
+        seed[b] = seed.count(b) ? std::min(seed[b], tc) : tc;
+      }
+      else if (isBefore(node, b, a))   // b higher than a => a must yield again
+      {
+        work.insert(a);
+        seed[a] = seed.count(a) ? std::min(seed[a], tc) : tc;
+      }
+      // unordered pair: leave it for solveNode to branch on
+    }
+  }
+  return true;
+}
+
+bool PBS::replanAgentSuffix(PBSNode& node, std::size_t agent_idx,
+                            double t_seed, double w_start, double w_end)
+{
+  AgentInfo& agent = node.agents[agent_idx];
+  std::vector<std::size_t> higher = getHigherPriorityAgents(node, agent_idx);
+
+  // 1) Freeze the committed prefix and find a *valid* state to restart from.
+  double t_freeze = findValidFreezeStart(node, agent_idx, higher, t_seed, w_start);
+  if (t_freeze < 0.0)
+  {
+    ROS_WARN("PBS::replanAgentSuffix: no valid freeze state for '%s'.", agent.name.c_str());
+    return false;
+  }
+
+  // 2) Determine which goal the agent is heading to, and re-plan the *entire*
+  //    remaining goal sequence (no truncation).
+  int g0 = nextGoalIndexAtTime(agent, t_freeze, 0.05);
+  if (g0 < 0 || agent.goals.empty())
+  {
+    ROS_WARN("PBS::replanAgentSuffix: no remaining goal for '%s'.", agent.name.c_str());
+    return false;
+  }
+
+  std::vector<double> vmax = jointVelocityLimits(agent.move_group);
+  std::vector<double> q_cur = getAgentPositionsAtTime(agent, t_freeze);
+  double t_cur = t_freeze;
+  std::vector<AgentInfo::TrajectoryPoint> suffix;
+  bool first = true;
+
+  for (int g = g0; g < static_cast<int>(agent.goals.size()); ++g)
+  {
+    if (agent.goals[g].type != AgentInfo::Goal::JOINT)
+      continue;  // pose goals must be converted to joint goals before PBS
+
+    TimeAwareRRT rrt(robot_model_, planning_scene_, node.agents, agent_idx,
+                     delta_time_, horizon_, max_rrt_nodes_);
+    if (!vmax.empty())
+      rrt.setMaxJointVelocities(vmax);
+    rrt.setWaitBias(0.2);
+
+    std::vector<AgentInfo::TrajectoryPoint> seg;
+    if (!rrt.plan(t_cur, q_cur, agent.goals[g].joint_values, higher, seg))
+    {
+      ROS_WARN("PBS::replanAgentSuffix: RRT failed for '%s' toward goal %d.",
+               agent.name.c_str(), g);
+      return false;
+    }
+
+    // Skip the duplicated junction point between consecutive segments.
+    for (std::size_t k = (first ? 0 : 1); k < seg.size(); ++k)
+      suffix.push_back(seg[k]);
+    first = false;
+    t_cur = seg.back().time;
+    q_cur = seg.back().positions;
+  }
+
+  if (suffix.empty())
+    return false;
+
+  // 3) Splice: committed prefix (< t_freeze) + freshly planned suffix.
+  std::vector<AgentInfo::TrajectoryPoint> merged;
+  merged.reserve(agent.trajectory.size() + suffix.size());
+  for (const auto& pt : agent.trajectory)
+  {
+    if (pt.time < t_freeze - 1e-6)
+      merged.push_back(pt);
+    else
+      break;
+  }
+  for (auto& pt : suffix)
+    merged.push_back(pt);
+  agent.trajectory.swap(merged);
+
+  ROS_INFO("PBS::replanAgentSuffix: '%s' replanned from t=%.2f through goals [%d..%d] (%zu pts).",
+           agent.name.c_str(), t_freeze, g0,
+           static_cast<int>(agent.goals.size()) - 1, agent.trajectory.size());
+  return true;
+}
+
+double PBS::findValidFreezeStart(const PBSNode& node, std::size_t agent_idx,
+                                 const std::vector<std::size_t>& higher,
+                                 double t_seed, double w_start) const
+{
+  double t = std::floor(t_seed / delta_time_ + 1e-9) * delta_time_;
+  double t_min = std::max(0.0, w_start);
+
+  for (; t >= t_min - 1e-9; t -= delta_time_)
+  {
+    double tq = std::max(t, 0.0);
+    std::vector<double> q = getAgentPositionsAtTime(node.agents[agent_idx], tq);
+    if (stateValidVsHigher(node, agent_idx, q, tq, higher))
+      return tq;
+  }
+  return -1.0;
+}
+
+int PBS::nextGoalIndexAtTime(const AgentInfo& agent, double t, double goal_tol) const
+{
+  if (agent.goals.empty())
+    return -1;
+
+  // A goal g is "reached by time t" if some prefix waypoint (time <= t) is within
+  // goal_tol of it. Goals are sequential, so stop at the first unreached goal.
+  int last_reached = -1;
+  for (int g = 0; g < static_cast<int>(agent.goals.size()); ++g)
   {
     const auto& goal = agent.goals[g];
     if (goal.type != AgentInfo::Goal::JOINT)
-      continue;
+      break;  // cannot reason about a non-joint goal here
 
+    bool reached = false;
     for (const auto& pt : agent.trajectory)
     {
+      if (pt.time > t + 1e-6)
+        break;
       if (pt.positions.size() != goal.joint_values.size())
         continue;
       double d2 = 0.0;
@@ -269,161 +451,97 @@ std::pair<int, double> PBS::findActiveGoalSegment(const AgentInfo& agent,
         double diff = pt.positions[j] - goal.joint_values[j];
         d2 += diff * diff;
       }
-      if (std::sqrt(d2) <= goal_tol)
-      {
-        goal_times[g] = pt.time;
-        break;
-      }
+      if (std::sqrt(d2) <= goal_tol) { reached = true; break; }
     }
-  }
-
-  // Find largest g such that goal_times[g] <= t_conflict
-  for (int g = static_cast<int>(agent.goals.size()) - 1; g >= 0; --g)
-  {
-    if (goal_times[g] < std::numeric_limits<double>::infinity() &&
-        goal_times[g] <= t_conflict + 1e-6)
-    {
-      active_g = g;
-      t_last_goal = goal_times[g];
-      break;
-    }
-  }
-
-  return {active_g, t_last_goal};
-}
-
-// === Local replan with TimeAwareRRT ===
-
-bool PBS::localReplan(PBSNode& node,
-                      std::size_t agent_idx,
-                      double t_conflict,
-                      double t_freeze_margin,
-                      double goal_tol)
-{
-  AgentInfo& agent = node.agents[agent_idx];
-
-  ROS_INFO("PBS::localReplan: agent '%s' at t=%.3f.",
-           agent.name.c_str(), t_conflict);
-
-  // 1) Determine active goal segment; this yields the "next goal" index.
-  auto seg = findActiveGoalSegment(agent, t_conflict, goal_tol);
-  int g_prev = seg.first;
-  double t_last_goal = seg.second;
-
-  int g_target = -1;
-  if (g_prev < 0)
-  {
-    // collision before reaching goal[0]: segment start->goal[0]
-    if (!agent.goals.empty())
-      g_target = 0;
-  }
-  else if (g_prev < static_cast<int>(agent.goals.size()) - 1)
-  {
-    // segment goal[g_prev] -> goal[g_prev+1]
-    g_target = g_prev + 1;
-  }
-  else
-  {
-    // collision after last goal; replan toward last goal again
-    g_target = static_cast<int>(agent.goals.size()) - 1;
-  }
-
-  if (g_target < 0 || g_target >= static_cast<int>(agent.goals.size()))
-  {
-    ROS_WARN("PBS::localReplan: no valid target goal for '%s'.", agent.name.c_str());
-    return false;
-  }
-
-  const auto& goal = agent.goals[g_target];
-  if (goal.type != AgentInfo::Goal::JOINT)
-  {
-    ROS_WARN("PBS::localReplan: goal %d for '%s' is not JOINT.", g_target, agent.name.c_str());
-    return false;
-  }
-
-  // 2) Extended freeze: we freeze everything up to t_freeze_end
-  //    (SIPP-like stronger commitment). We choose:
-  //      t_freeze_end = max(t_last_goal, t_conflict - t_freeze_margin)
-  double t_freeze_end = t_conflict - t_freeze_margin;
-  if (t_last_goal > t_freeze_end)
-    t_freeze_end = t_last_goal;
-
-  if (t_freeze_end < 0.0)
-    t_freeze_end = 0.0;
-
-  // Replan segment will start at t_replan >= t_freeze_end and <= t_conflict
-  double t_replan = t_conflict;
-  if (t_replan < t_freeze_end)
-    t_replan = t_freeze_end;
-
-  // Get starting configuration for replan
-  const std::vector<double>& q_start = getAgentPositionsAtTime(agent, t_replan);
-  const std::vector<double>& q_goal  = goal.joint_values;
-
-  // 3) Build list of higher-priority agents for this agent
-  std::vector<std::size_t> higher = getHigherPriorityAgents(node, agent_idx);
-
-  // 4) Run time-aware RRT from (q_start, t_replan) to q_goal
-  TimeAwareRRT rrt(robot_model_, planning_scene_, node.agents, agent_idx,
-                   delta_time_, horizon_, max_rrt_nodes_);
-  rrt.setMaxJointVelocity(1.0);  // you can tune this
-
-  std::vector<AgentInfo::TrajectoryPoint> new_segment;
-  bool ok = rrt.plan(t_replan, q_start, q_goal, higher, new_segment);
-  if (!ok)
-  {
-    ROS_WARN("PBS::localReplan: time-aware RRT failed for '%s'.", agent.name.c_str());
-    return false;
-  }
-
-  // 5) Splice new segment into agent.trajectory:
-  //    - keep points with time < t_replan
-  //    - append new_segment (which starts at t_replan)
-  std::vector<AgentInfo::TrajectoryPoint> new_traj;
-  new_traj.reserve(agent.trajectory.size() + new_segment.size());
-
-  for (const auto& pt : agent.trajectory)
-  {
-    if (pt.time < t_replan - 1e-6)
-      new_traj.push_back(pt);
+    if (reached)
+      last_reached = g;
     else
       break;
   }
-  for (auto& pt : new_segment)
+
+  int next = last_reached + 1;
+  if (next >= static_cast<int>(agent.goals.size()))
+    next = static_cast<int>(agent.goals.size()) - 1;  // already at/after last goal
+  return next;
+}
+
+// Validity of q for agent_idx against higher-priority agents (+ world + self).
+// Lower/equal-priority agents are intentionally ignored: they must plan around
+// this agent, not vice versa. This mirrors TimeAwareRRT::isStateValid so the
+// freeze seed and the RRT agree on what "valid" means.
+bool PBS::stateValidVsHigher(const PBSNode& node, std::size_t agent_idx,
+                             const std::vector<double>& q, double t,
+                             const std::vector<std::size_t>& higher) const
+{
+  const auto* jmg = robot_model_->getJointModelGroup(node.agents[agent_idx].move_group);
+  if (!jmg || q.size() != jmg->getVariableCount())
+    return false;
+
+  moveit::core::RobotState& rs = *work_state_;
+  rs.setToDefaultValues();
+  rs.setJointGroupPositions(jmg, q);
+
+  for (std::size_t idx : higher)
   {
-    new_traj.push_back(pt);
+    if (idx >= node.agents.size())
+      continue;
+    const auto* jo = robot_model_->getJointModelGroup(node.agents[idx].move_group);
+    if (!jo)
+      continue;
+    std::vector<double> qo = getAgentPositionsAtTime(node.agents[idx], t);
+    if (qo.size() == jo->getVariableCount())
+      rs.setJointGroupPositions(jo, qo);
   }
+  rs.update();
 
-  agent.trajectory.swap(new_traj);
+  collision_detection::CollisionRequest creq;
+  collision_detection::CollisionResult  cres;
+  planning_scene_->checkCollision(creq, cres, rs);
+  return !cres.collision;
+}
 
-  ROS_INFO("PBS::localReplan: agent '%s' replanned to goal %d with %zu points.",
-           agent.name.c_str(), g_target, agent.trajectory.size());
-
-  return true;
+std::vector<double> PBS::jointVelocityLimits(const std::string& group) const
+{
+  std::vector<double> vmax;
+  const auto* jmg = robot_model_->getJointModelGroup(group);
+  if (!jmg)
+    return vmax;
+  const std::vector<std::string>& names = jmg->getVariableNames();
+  vmax.resize(names.size(), 1.0);
+  for (std::size_t i = 0; i < names.size(); ++i)
+  {
+    const auto& vb = robot_model_->getVariableBounds(names[i]);
+    if (vb.velocity_bounded_ && vb.max_velocity_ > 0.0)
+      vmax[i] = vb.max_velocity_ * vel_scale_;
+  }
+  return vmax;
 }
 
 // === Low-level utilities ===
-
-const std::vector<double>& PBS::getAgentPositionsAtTime(const AgentInfo& agent,
-                                                        double t_query) const
+std::vector<double> PBS::getAgentPositionsAtTime(const AgentInfo& agent, double t_query) const
 {
   const auto& traj = agent.trajectory;
-
   if (traj.empty())
-  {
-    static const std::vector<double> dummy;
-    return dummy;
-  }
+    return {};
 
-  if (t_query <= traj.front().time + 1e-6)
+  if (t_query <= traj.front().time)
     return traj.front().positions;
-  if (t_query >= traj.back().time - 1e-6)
+  if (t_query >= traj.back().time)
     return traj.back().positions;
 
-  for (std::size_t i = 0; i < traj.size(); ++i)
+  for (std::size_t i = 0; i + 1 < traj.size(); ++i)
   {
-    if (traj[i].time >= t_query - 1e-6)
-      return traj[i].positions;
+    double t0 = traj[i].time, t1 = traj[i + 1].time;
+    if (t_query >= t0 && t_query <= t1)
+    {
+      double a = (t1 > t0) ? (t_query - t0) / (t1 - t0) : 0.0;
+      const auto& q0 = traj[i].positions;
+      const auto& q1 = traj[i + 1].positions;
+      std::vector<double> q(q0.size());
+      for (std::size_t j = 0; j < q0.size(); ++j)
+        q[j] = (1.0 - a) * q0[j] + a * q1[j];
+      return q;
+    }
   }
   return traj.back().positions;
 }
@@ -432,10 +550,8 @@ double PBS::getMaxTrajectoryTime(const PBSNode& node) const
 {
   double max_t = 0.0;
   for (const auto& ag : node.agents)
-  {
     if (!ag.trajectory.empty() && ag.trajectory.back().time > max_t)
       max_t = ag.trajectory.back().time;
-  }
   return max_t;
 }
 

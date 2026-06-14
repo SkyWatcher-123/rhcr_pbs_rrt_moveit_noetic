@@ -7,6 +7,7 @@
 #include <string>
 
 #include <moveit/robot_model/robot_model.h>
+#include <moveit/robot_state/robot_state.h>
 #include <moveit/planning_scene/planning_scene.h>
 
 #include "rhcr_mapf_planners/rhcr_planner.h"
@@ -81,6 +82,23 @@ public:
    */
   void setMaxJointVelocity(double v_max);
 
+  /**
+   * @brief Set per-joint velocity bounds (rad/s, or m/s for prismatic joints).
+   *
+   * Overrides the scalar bound from setMaxJointVelocity() when non-empty, so the
+   * step size respects each joint's own limit (e.g. a rail vs. a wrist joint).
+   */
+  void setMaxJointVelocities(const std::vector<double>& v_max_per_joint);
+
+  /**
+   * @brief Fraction of expansions [0,1] that attempt a pure "wait" edge:
+   *        hold the configuration and advance time by delta_time_.
+   *
+   * Waiting lets a lower-priority agent yield by pausing until a higher-priority
+   * agent clears. Default is 0.2.
+   */
+  void setWaitBias(double wait_bias);
+
 private:
   struct Node
   {
@@ -96,7 +114,10 @@ private:
   double delta_time_;
   double horizon_;
   std::size_t max_nodes_;
-  double v_max_;  ///< simple per-joint velocity bound
+  double v_max_;                          ///< scalar velocity bound (fallback)
+  std::vector<double> v_max_per_joint_;   ///< per-joint bounds (empty => use v_max_)
+  double wait_bias_ = 0.2;                ///< probability of a wait expansion
+  mutable moveit::core::RobotStatePtr work_state_;  ///< scratch state (no scene mutation)
 
   /**
    * @brief Sample a random configuration in joint space.
@@ -153,10 +174,10 @@ private:
    *
    *  - If t_query is before the first waypoint, returns the first.
    *  - If t_query is after the last waypoint, returns the last.
-   *  - This is a zero-order hold (no interpolation) for simplicity.
+   *  - Otherwise linearly interpolates between the bracketing waypoints.
    */
-  const std::vector<double>& getAgentPositionsAtTime(std::size_t agent_index,
-                                                     double t_query) const;
+  std::vector<double> getAgentPositionsAtTime(std::size_t agent_index,
+                                              double t_query) const;
 
   /**
    * @brief Compute squared Euclidean distance between two joint vectors.

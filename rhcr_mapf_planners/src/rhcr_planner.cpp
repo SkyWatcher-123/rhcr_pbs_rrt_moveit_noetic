@@ -5,6 +5,7 @@
 #include <fstream>
 #include <sstream>
 #include <cmath>
+#include <algorithm>
 
 // MoveIt
 #include <moveit/move_group_interface/move_group_interface.h>
@@ -39,6 +40,9 @@ bool RHCRPlanner::initialize()
   nh_.param("max_velocity_scaling",     max_vel_scaling_, 1.0);
   nh_.param("max_acceleration_scaling", max_acc_scaling_, 1.0);
   nh_.param("horizon",                  horizon_,         10.0);
+  nh_.param("replan_window",            replan_window_,   4.0);
+  nh_.param("commit_horizon",           commit_horizon_,  2.0);
+  nh_.param("max_windows",              max_windows_,     100);
 
   int max_rrt_nodes_int = static_cast<int>(max_rrt_nodes_);
   nh_.param("max_rrt_nodes", max_rrt_nodes_int, 2000);
@@ -546,10 +550,60 @@ void RHCRPlanner::resolveConflicts()
     return;
   }
 
-  // PBS uses the shared robot model / planning scene and time-aware parameters
-  PBS pbs(robot_model_, planning_scene_, delta_time_, horizon_, max_rrt_nodes_);
+  bool use_replanning = true;
+  nh_.param("pbs_use_replanning", use_replanning, true);
+  if (!use_replanning)
+  {
+    ROS_INFO("RHCRPlanner: pbs_use_replanning=false, skipping PBS conflict resolution.");
+    return;
+  }
 
-  pbs.resolveConflicts(agents_);
+  // PBS uses the shared robot model / planning scene and time-aware parameters.
+  PBS pbs(robot_model_, planning_scene_, delta_time_, horizon_, max_rrt_nodes_);
+  pbs.setVelocityScaling(max_vel_scaling_);
+
+  auto makespan = [&]() -> double {
+    double m = 0.0;
+    for (const auto& a : agents_)
+      if (!a.trajectory.empty())
+        m = std::max(m, a.trajectory.back().time);
+    return m;
+  };
+
+  const double W = replan_window_;
+  double H = (commit_horizon_ > 0.0) ? commit_horizon_ : replan_window_;
+  if (H > W) H = W;   // RHCR invariant: commit slice h <= resolution window w
+
+  // Degenerate window => single-shot resolution over the whole horizon.
+  if (W <= 0.0)
+  {
+    pbs.resolveConflicts(agents_);
+    updateCurrentGoalIndices(0.05);
+    return;
+  }
+
+  // Rolling horizon: resolve conflicts within [t_now, t_now+W], commit the first
+  // H seconds (frozen for later windows), then roll t_now forward by H.
+  double t_now = 0.0;
+  int round = 0;
+  while (t_now < makespan() + 1e-6 && round < max_windows_)
+  {
+    double w_end = t_now + W;
+    ROS_INFO("RHCR round %d: resolving conflicts in [%.2f, %.2f], committing up to %.2f.",
+             round, t_now, w_end, t_now + H);
+
+    if (!pbs.resolveConflicts(agents_, t_now, w_end))
+      ROS_WARN("RHCR round %d: window not fully resolved; committing best-effort and rolling on.",
+               round);
+
+    t_now += H;
+    ++round;
+  }
+
+  if (round >= max_windows_)
+    ROS_WARN("RHCRPlanner::resolveConflicts: hit max_windows cap (%d).", max_windows_);
+
+  updateCurrentGoalIndices(0.05);
 }
 
 void RHCRPlanner::updateCurrentGoalIndices(double goal_tolerance)

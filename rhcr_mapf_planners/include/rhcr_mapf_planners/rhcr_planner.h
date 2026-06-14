@@ -97,7 +97,12 @@ private:
 
   // Global time-aware RRT / RHCR parameters
   std::size_t max_rrt_nodes_ = 2000;         ///< Default maximum nodes for time-aware RRT
-  double      horizon_       = 10.0;         ///< Default planning horizon [s]
+  double      horizon_       = 10.0;         ///< RRT per-segment time budget [s]
+
+  // Rolling-horizon (RHCR) coordination parameters
+  double      replan_window_  = 4.0;         ///< W: resolve conflicts within [t_now, t_now+W]
+  double      commit_horizon_ = 2.0;         ///< H: committed slice per round (H <= W)
+  int         max_windows_    = 100;         ///< safety cap on rolling rounds
 
   // Shared MoveIt model & planning scene used by PBS (and potentially RHCR)
   moveit::core::RobotModelConstPtr robot_model_;

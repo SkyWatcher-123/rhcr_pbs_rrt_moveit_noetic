@@ -55,7 +55,12 @@ agents:
 delta_time: 0.1
 max_velocity_scaling: 0.8
 max_acceleration_scaling: 0.8
-pbs_use_replanning: True    # for now, keep false; framework is provided
+pbs_use_replanning: True    # NOW honored by RHCRPlanner::resolveConflicts
+
+# Rolling-horizon (RHCR) coordination parameters
+replan_window: 4.0     # W: resolve conflicts within [t_now, t_now + W]
+commit_horizon: 2.0    # H: commit this slice each round, then roll forward (H <= W)
+max_windows: 100       # safety cap on rolling rounds
 
 output_folder: "irb_xarm_moveit_config"    # or xxx_moveit_config, etc.
 output_file: "trajectory.json"
